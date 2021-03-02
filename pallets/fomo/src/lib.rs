@@ -1,17 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-/// Edit this file to define custom logic or remove it if it is not needed.
-/// Learn more about FRAME and the core library of Substrate FRAME pallets:
-/// https://substrate.dev/docs/en/knowledgebase/runtime/frame
-
+use core::convert::TryInto;
 use frame_support::{
-	decl_module, decl_storage, decl_event, decl_error, dispatch, 
-	traits::{
-		Get,
-		Currency
-	}
+    decl_error, decl_event, decl_module, decl_storage, dispatch, ensure,
+    sp_runtime::{traits::AccountIdConversion, ModuleId},
+    traits::{Currency, ExistenceRequirement::AllowDeath, Get},
 };
-use frame_system::ensure_signed;
+use frame_system::{self as system, ensure_signed};
 
 #[cfg(test)]
 mod mock;
@@ -19,102 +14,147 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+// This 8 char ID can be converted into an account with no keys
+// This system account holds the balance of the contributed funds
+const PALLET_ID: ModuleId = ModuleId(*b"fomofomo");
+
+type AccountIdOf<T> = <T as system::Config>::AccountId;
+type BalanceOf<T> = <<T as Config>::Currency as Currency<AccountIdOf<T>>>::Balance;
+
 /// Configure the pallet by specifying the parameters and types on which it depends.
 pub trait Config: frame_system::Config {
-	/// Because this pallet emits events, it depends on the runtime's definition of an event.
-	type Event: From<Event<Self>> + Into<<Self as frame_system::Config>::Event>;
-	type Currency: Currency<Self::AccountId>; 
+    type Event: From<Event<Self>> + Into<<Self as frame_system::Config>::Event>;
+    type Currency: Currency<Self::AccountId>;
+    /// How much the price increases with each round
+    type PriceIncrement: Get<BalanceOf<Self>>;
+    /// How many blocks in which noone buys a ticket for the game to end
+    type BlocksToWin: Get<Self::BlockNumber>;
 }
 
-// The pallet's runtime storage items.
-// https://substrate.dev/docs/en/knowledgebase/runtime/storage
 decl_storage! {
-	// A unique name is used to ensure that the pallet's storage items are isolated.
-	// This name may be updated, but each pallet in the runtime must use a unique name.
-	// ---------------------------------vvvvvvvvvvvvvv
-	trait Store for Module<T: Config> as FOMOModule {
-		// Learn more about declaring storage items:
-		// https://substrate.dev/docs/en/knowledgebase/runtime/storage#declaring-storage-items
-		Something get(fn something): Option<u32>;
-	}
+    trait Store for Module<T: Config> as FOMOModule {
+        Round get(fn round): u128 = 0;
+        Leader get(fn leader): Option<T::AccountId>;
+        LastPaymentBlock get(fn last_payment_block): T::BlockNumber = 0.into();
+    }
 }
 
-// Pallets use events to inform users when important changes are made.
-// https://substrate.dev/docs/en/knowledgebase/runtime/events
 decl_event!(
-	pub enum Event<T> where AccountId = <T as frame_system::Config>::AccountId {
-		/// Event documentation should end with an array that provides descriptive names for event
-		/// parameters. [something, who]
-		SomethingStored(u32, AccountId),
-	}
+    pub enum Event<T>
+    where
+        AccountId = <T as frame_system::Config>::AccountId,
+        Balance = <<T as Config>::Currency as Currency<AccountIdOf<T>>>::Balance
+    {
+        /// A player purchased a ticket. [who, price]
+        TicketPurchased(AccountId, Balance),
+        /// The winner has claimed the pool. [who, winnings]
+        PoolClaimed(AccountId, Balance),
+    }
 );
 
-// Errors inform users that something went wrong.
 decl_error! {
-	pub enum Error for Module<T: Config> {
-		/// Error names should be descriptive.
-		NoneValue,
-		/// Errors should have helpful documentation associated with them.
-		StorageOverflow,
-	}
+    pub enum Error for Module<T: Config> {
+        NoneValue,
+        /// The game cannot start until a custodian account is configured
+        NoCustodianSet,
+        /// Attempted to purchase ticket but did not allocate enough funds in the transfer
+        InsufficientFunds,
+        /// An error occurs due to impls provided by runtime not supporting conversions
+        ValueConversionError,
+        /// The game is over preventing the intended action
+        GameIsOver,
+        /// The game is not over preventing the intended action
+        GameIsNotOver,
+        /// The account attempting to claim the pool is not the current leader
+        ClaimerIsNotLeader,
+    }
 }
 
-// Dispatchable functions allows users to interact with the pallet and invoke state changes.
-// These functions materialize as "extrinsics", which are often compared to transactions.
-// Dispatchable functions must be annotated with a weight and must return a DispatchResult.
+// Can add helper functions on the config here
+impl<T: Config> Module<T> {
+    pub fn pool_account_id() -> T::AccountId {
+        PALLET_ID.into_account()
+    }
+
+    fn pool_balance() -> BalanceOf<T> {
+        T::Currency::free_balance(&Self::pool_account_id())
+    }
+
+    fn current_price() -> Result<BalanceOf<T>, Error<T>> {
+        let price_increment = TryInto::<u128>::try_into(T::PriceIncrement::get())
+            .map_err(|_| Error::ValueConversionError)?;
+        let round = Round::get();
+        ((round + 1) * price_increment)
+            .try_into()
+            .map_err(|_| Error::ValueConversionError)
+    }
+
+    fn game_is_over() -> bool {
+    	let now = <system::Module<T>>::block_number();
+        let last_payment_block = LastPaymentBlock::<T>::get();
+        now >= last_payment_block + T::BlocksToWin::get()
+    }
+}
+
 decl_module! {
-	pub struct Module<T: Config> for enum Call where origin: T::Origin {
-		// Errors must be initialized if they are used by the pallet.
-		type Error = Error<T>;
+    pub struct Module<T: Config> for enum Call where origin: T::Origin {
+        type Error = Error<T>;
 
-		// Events must be initialized if they are used by the pallet.
-		fn deposit_event() = default;
+        fn deposit_event() = default;
 
-		#[weight = 10_000]
-		pub fn buy(origin) -> dispatch::DispatchResult {
-			Ok(())
-		}
-		
-		#[weight = 10_000]
-		pub fn claim(origin) -> dispatch::DispatchResult {
-			Ok(())
-		}
+        #[weight = 10_000]
+        pub fn buy_ticket(origin, max_spend: BalanceOf<T>) -> dispatch::DispatchResult {
+            let purchaser = ensure_signed(origin)?;
+			
+			// ensure game is not over
+			ensure!(!Self::game_is_over(), Error::<T>::GameIsOver);
 
-		/// An example dispatchable that takes a singles value as a parameter, writes the value to
-		/// storage and emits an event. This function must be dispatched by a signed extrinsic.
-		#[weight = 10_000 + T::DbWeight::get().writes(1)]
-		pub fn do_something(origin, something: u32) -> dispatch::DispatchResult {
-			// Check that the extrinsic was signed and get the signer.
-			// This function will return an error if the extrinsic is not signed.
-			// https://substrate.dev/docs/en/knowledgebase/runtime/origin
-			let who = ensure_signed(origin)?;
+			// the caller provided enough funds to purchase a ticket
+            let current_price = Self::current_price()?;
+            ensure!(current_price <= max_spend, Error::<T>::InsufficientFunds);
 
-			// Update storage.
-			Something::put(something);
+            T::Currency::transfer(
+                &purchaser,
+                &Self::pool_account_id(),
+                current_price,
+                AllowDeath
+            )?;
 
-			// Emit an event.
-			Self::deposit_event(RawEvent::SomethingStored(something, who));
-			// Return a successful DispatchResult
-			Ok(())
-		}
+            // this new player is the leader and the round is incremented
+            Leader::<T>::put(&purchaser);
+            Round::put(Round::get() + 1);
+            let now = <system::Module<T>>::block_number();
+            LastPaymentBlock::<T>::put(now);
 
-		/// An example dispatchable that may throw a custom error.
-		#[weight = 10_000 + T::DbWeight::get().reads_writes(1,1)]
-		pub fn cause_error(origin) -> dispatch::DispatchResult {
-			let _who = ensure_signed(origin)?;
+            Self::deposit_event(RawEvent::TicketPurchased(purchaser, current_price));
 
-			// Read a value from storage.
-			match Something::get() {
-				// Return an error if the value has not been set.
-				None => Err(Error::<T>::NoneValue)?,
-				Some(old) => {
-					// Increment the value read from storage; will error in the event of overflow.
-					let new = old.checked_add(1).ok_or(Error::<T>::StorageOverflow)?;
-					// Update the value in storage with the incremented result.
-					Something::put(new);
-					Ok(())
-				},
-			}
-		}
-	}
+            Ok(())
+        }
+
+
+        #[weight = 10_000]
+        pub fn claim(origin) -> dispatch::DispatchResult {
+            let claimer = ensure_signed(origin)?;
+
+            // ensure the claimer is the current leader
+            ensure!(claimer == Leader::<T>::get().unwrap(), Error::<T>::ClaimerIsNotLeader);
+
+            // ensure the required time to win has elapsed
+            ensure!(Self::game_is_over(), Error::<T>::GameIsNotOver);
+
+            let winning_balance = Self::pool_balance();
+
+            // transfer all funds out of the pool
+            T::Currency::transfer(
+                &Self::pool_account_id(),
+                &claimer,
+                winning_balance,
+                AllowDeath
+            )?;
+
+            Self::deposit_event(RawEvent::PoolClaimed(claimer, winning_balance));
+
+            Ok(())
+        }
+    }
 }
